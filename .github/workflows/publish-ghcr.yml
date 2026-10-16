@@ -2,12 +2,14 @@ name: Publish ChiefOnboarding to GHCR
 
 on:
   push:
-    branches:
-      - ghcr-bootstrap-v2.3.1
+    tags:
+      - 'v*'
+  schedule:
+    - cron: '17 6 * * *'
   workflow_dispatch:
     inputs:
       source_ref:
-        description: Git tag or commit to build
+        description: Docker Hub version tag to mirror
         required: true
         default: v2.3.1
         type: string
@@ -21,10 +23,45 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: ghcr-publish-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
+      - name: Find the newest stable Docker Hub release
+        id: upstream
+        if: github.event_name == 'schedule'
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import re
+          from urllib.request import Request, urlopen
+
+          url = "https://hub.docker.com/v2/namespaces/chiefonboarding/repositories/chiefonboarding/tags?page_size=100"
+          versions = []
+          pattern = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+
+          while url:
+              request = Request(url, headers={"Accept": "application/json", "User-Agent": "ChiefOnboarding-GHCR-mirror"})
+              with urlopen(request, timeout=30) as response:
+                  page = json.load(response)
+              for item in page.get("results", []):
+                  name = item.get("name", "")
+                  match = pattern.fullmatch(name)
+                  if match and item.get("tag_status") == "active":
+                      versions.append((tuple(map(int, match.groups())), name))
+              url = page.get("next")
+
+          if not versions:
+              raise SystemExit("Docker Hub returned no active stable version tags")
+
+          print(f"source_ref={max(versions)[1]}")
+          PY
+
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
@@ -32,16 +69,47 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Mirror the upstream image without rebuilding
+      - name: Select source and target tags
+        id: refs
         env:
-          SOURCE_REF: ${{ inputs.source_ref || 'v2.3.1' }}
-          IMAGE_TAG: ${{ inputs.image_tag || 'v2.3.1' }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_SOURCE_REF: ${{ inputs.source_ref }}
+          INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
+          LATEST_SOURCE_REF: ${{ steps.upstream.outputs.source_ref }}
         run: |
           set -euo pipefail
-          [[ "$SOURCE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          [[ "$IMAGE_TAG" =~ ^[A-Za-z0-9._-]+$ ]]
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
+            source_ref="$LATEST_SOURCE_REF"
+            image_tag="$LATEST_SOURCE_REF"
+          elif [[ "$EVENT_NAME" == "push" ]]; then
+            source_ref="$REF_NAME"
+            image_tag="$REF_NAME"
+          else
+            source_ref="${INPUT_SOURCE_REF:-v2.3.1}"
+            image_tag="${INPUT_IMAGE_TAG:-$source_ref}"
+          fi
+
+          [[ "$source_ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$image_tag" =~ ^[A-Za-z0-9._-]+$ ]]
+          echo "source_ref=$source_ref" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Mirror the upstream image without rebuilding
+        env:
+          SOURCE_REF: ${{ steps.refs.outputs.source_ref }}
+          IMAGE_TAG: ${{ steps.refs.outputs.image_tag }}
+        run: |
+          set -euo pipefail
           source="chiefonboarding/chiefonboarding:${SOURCE_REF}"
           target="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/chiefonboarding:${IMAGE_TAG}"
+
+          if docker manifest inspect "$target" >/dev/null 2>&1; then
+            echo "$target already exists; skipping immutable tag"
+            echo "Skipped $target because the tag is already present." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
           docker pull --platform linux/amd64 "$source"
           source_id="$(docker image inspect --format '{{.Id}}' "$source")"
           docker tag "$source" "$target"
