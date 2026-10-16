@@ -1,0 +1,51 @@
+name: Publish ChiefOnboarding to GHCR
+
+on:
+  push:
+    branches:
+      - ghcr-bootstrap-v2.3.1
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Git tag or commit to build
+        required: true
+        default: v2.3.1
+        type: string
+      image_tag:
+        description: GHCR tag to publish
+        required: true
+        default: v2.3.1
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Mirror the upstream image without rebuilding
+        env:
+          SOURCE_REF: ${{ inputs.source_ref || 'v2.3.1' }}
+          IMAGE_TAG: ${{ inputs.image_tag || 'v2.3.1' }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$IMAGE_TAG" =~ ^[A-Za-z0-9._-]+$ ]]
+          source="chiefonboarding/chiefonboarding:${SOURCE_REF}"
+          target="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/chiefonboarding:${IMAGE_TAG}"
+          docker pull --platform linux/amd64 "$source"
+          source_id="$(docker image inspect --format '{{.Id}}' "$source")"
+          docker tag "$source" "$target"
+          docker push "$target"
+          target_id="$(docker image inspect --format '{{.Id}}' "$target")"
+          test "$source_id" = "$target_id"
+          echo "Published $target with image ID $target_id" >> "$GITHUB_STEP_SUMMARY"
